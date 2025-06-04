@@ -2,8 +2,10 @@ package org.dfpl.lecture.db.bitmap;
 
 import java.nio.file.Files;
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.UUID;
 
 /**
@@ -22,6 +24,8 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
     private final Path file;
     /** number of bits managed by this bitset */
     private final int size;
+    /** number of bytes required to store {@link #size} bits */
+    private final int byteSize;
 
     /**
      * Create a temporary bitset. The data is stored in a unique file inside the
@@ -30,6 +34,7 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
     public MyBitSetImpl(String baseDirectory, int size) {
         this.baseDirectory = baseDirectory;
         this.size = size;
+        this.byteSize = (size + 7) / 8;
         ensureDirectory();
         this.file = Paths.get(baseDirectory, "tmp_" + UUID.randomUUID() + ".bit");
         initFile();
@@ -42,6 +47,7 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
     public MyBitSetImpl(String baseDirectory, String attr, String value, int size) {
         this.baseDirectory = baseDirectory;
         this.size = size;
+        this.byteSize = (size + 7) / 8;
         ensureDirectory();
         String safe = sanitize(attr + "_" + value);
         this.file = Paths.get(baseDirectory, safe + ".bit");
@@ -56,17 +62,25 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
         }
     }
 
-    /** create file with zeros when it does not exist */
+    /**
+     * Create the backing file if needed and adjust its length to
+     * {@link #byteSize}. The file content is meaningless when first
+     * created, so it is initialized with zeros.
+     */
     private void initFile() {
-        if (Files.exists(file)) {
-            return;
-        }
         try {
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < size; i++) {
-                sb.append('0');
+            byte[] data;
+            if (Files.exists(file)) {
+                data = Files.readAllBytes(file);
+                if (data.length == byteSize) {
+                    return; // file already initialized with correct size
+                }
+            } else {
+                data = new byte[0];
             }
-            Files.writeString(file, sb.toString());
+
+            byte[] newData = Arrays.copyOf(data, byteSize);
+            Files.write(file, newData);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -76,70 +90,84 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
         return name.replaceAll("[^a-zA-Z0-9\\-]", "_");
     }
 
-    /** read entire bitmap string from file */
-    private String readBits() {
+    /** read all bytes representing the bitmap */
+    private byte[] readBytes() {
         try {
             if (!Files.exists(file)) {
                 initFile();
             }
-            return Files.readString(file);
+            byte[] data = Files.readAllBytes(file);
+            if (data.length < byteSize) {
+                data = Arrays.copyOf(data, byteSize);
+                Files.write(file, data);
+            }
+            return data;
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
-    /** write entire bitmap string to file */
-    private void writeBits(String bits) {
+    /** write entire bitmap byte array to the backing file */
+    private void writeBytes(byte[] data) {
         try {
-            Files.writeString(file, bits);
+            if (data.length != byteSize) {
+                data = Arrays.copyOf(data, byteSize);
+            }
+            Files.write(file, data);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
-    /** helper to modify a single index */
-    private void setChar(int index, char value) {
-        String bits = readBits();
-        StringBuilder sb = new StringBuilder(bits);
-        while (sb.length() < size) {
-            sb.append('0');
+    /** helper to modify a single bit */
+    private void setBit(int index, boolean value) {
+        byte[] data = readBytes();
+        int byteIdx = index / 8;
+        int bit = index % 8;
+        if (value) {
+            data[byteIdx] |= (1 << bit);
+        } else {
+            data[byteIdx] &= ~(1 << bit);
         }
-        sb.setCharAt(index, value);
-        writeBits(sb.toString());
+        writeBytes(data);
     }
 
     @Override
     public MyBitSet clone() {
         MyBitSetImpl cloned = new MyBitSetImpl(baseDirectory, size);
-        cloned.writeBits(readBits());
+        cloned.writeBytes(readBytes());
         return cloned;
     }
 
     @Override
     public void flip(int bitIndex) {
         checkIndex(bitIndex);
-        String bits = readBits();
-        char c = bits.charAt(bitIndex);
-        setChar(bitIndex, c == '1' ? '0' : '1');
+        byte[] data = readBytes();
+        int byteIdx = bitIndex / 8;
+        int bit = bitIndex % 8;
+        data[byteIdx] ^= (1 << bit);
+        writeBytes(data);
     }
 
     @Override
     public void set(int bitIndex) {
         checkIndex(bitIndex);
-        setChar(bitIndex, '1');
+        setBit(bitIndex, true);
     }
 
     @Override
     public void clear(int bitIndex) {
         checkIndex(bitIndex);
-        setChar(bitIndex, '0');
+        setBit(bitIndex, false);
     }
 
     @Override
     public boolean get(int bitIndex) {
         checkIndex(bitIndex);
-        String bits = readBits();
-        return bits.charAt(bitIndex) == '1';
+        byte[] data = readBytes();
+        int byteIdx = bitIndex / 8;
+        int bit = bitIndex % 8;
+        return (data[byteIdx] & (1 << bit)) != 0;
     }
 
     private void checkIndex(int idx) {
@@ -153,11 +181,11 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
         if (!(set instanceof MyBitSetImpl other)) {
             return false;
         }
-        String a = readBits();
-        String b = other.readBits();
-        int len = Math.min(a.length(), b.length());
+        byte[] a = readBytes();
+        byte[] b = other.readBytes();
+        int len = Math.min(a.length, b.length);
         for (int i = 0; i < len; i++) {
-            if (a.charAt(i) == '1' && b.charAt(i) == '1') {
+            if ((a[i] & b[i]) != 0) {
                 return true;
             }
         }
@@ -166,12 +194,10 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
 
     @Override
     public int cardinality() {
-        String bits = readBits();
+        byte[] data = readBytes();
         int count = 0;
-        for (int i = 0; i < bits.length(); i++) {
-            if (bits.charAt(i) == '1') {
-                count++;
-            }
+        for (byte b : data) {
+            count += Integer.bitCount(b & 0xFF);
         }
         return count;
     }
@@ -181,17 +207,16 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
         if (!(set instanceof MyBitSetImpl other)) {
             return;
         }
-        String a = readBits();
-        String b = other.readBits();
-        StringBuilder sb = new StringBuilder();
-        int len = Math.min(a.length(), b.length());
+        byte[] a = readBytes();
+        byte[] b = other.readBytes();
+        int len = Math.min(a.length, b.length);
         for (int i = 0; i < len; i++) {
-            sb.append((a.charAt(i) == '1' && b.charAt(i) == '1') ? '1' : '0');
+            a[i] &= b[i];
         }
-        while (sb.length() < size) {
-            sb.append('0');
+        if (a.length > byteSize) {
+            a = Arrays.copyOf(a, byteSize);
         }
-        writeBits(sb.toString());
+        writeBytes(a);
     }
 
     @Override
@@ -199,17 +224,16 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
         if (!(set instanceof MyBitSetImpl other)) {
             return;
         }
-        String a = readBits();
-        String b = other.readBits();
-        StringBuilder sb = new StringBuilder();
-        int len = Math.min(a.length(), b.length());
+        byte[] a = readBytes();
+        byte[] b = other.readBytes();
+        int len = Math.min(a.length, b.length);
         for (int i = 0; i < len; i++) {
-            sb.append((a.charAt(i) == '1' || b.charAt(i) == '1') ? '1' : '0');
+            a[i] |= b[i];
         }
-        while (sb.length() < size) {
-            sb.append('0');
+        if (a.length > byteSize) {
+            a = Arrays.copyOf(a, byteSize);
         }
-        writeBits(sb.toString());
+        writeBytes(a);
     }
 
     @Override
@@ -217,17 +241,16 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
         if (!(set instanceof MyBitSetImpl other)) {
             return;
         }
-        String a = readBits();
-        String b = other.readBits();
-        StringBuilder sb = new StringBuilder();
-        int len = Math.min(a.length(), b.length());
+        byte[] a = readBytes();
+        byte[] b = other.readBytes();
+        int len = Math.min(a.length, b.length);
         for (int i = 0; i < len; i++) {
-            sb.append((a.charAt(i) != b.charAt(i)) ? '1' : '0');
+            a[i] ^= b[i];
         }
-        while (sb.length() < size) {
-            sb.append('0');
+        if (a.length > byteSize) {
+            a = Arrays.copyOf(a, byteSize);
         }
-        writeBits(sb.toString());
+        writeBytes(a);
     }
 
     @Override
@@ -235,15 +258,13 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
         if (fromIndex < 0 || toIndex > size || fromIndex > toIndex) {
             throw new IndexOutOfBoundsException();
         }
-        String bits = readBits();
-        StringBuilder sb = new StringBuilder(bits);
-        while (sb.length() < size) {
-            sb.append('0');
-        }
+        byte[] data = readBytes();
         for (int i = fromIndex; i < toIndex; i++) {
-            sb.setCharAt(i, '1');
+            int byteIdx = i / 8;
+            int bit = i % 8;
+            data[byteIdx] |= (1 << bit);
         }
-        writeBits(sb.toString());
+        writeBytes(data);
     }
 
     @Override
@@ -251,9 +272,11 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
         if (fromIndex < 0) {
             throw new IndexOutOfBoundsException();
         }
-        String bits = readBits();
-        for (int i = fromIndex; i < bits.length(); i++) {
-            if (bits.charAt(i) == '1') {
+        byte[] data = readBytes();
+        for (int i = fromIndex; i < size; i++) {
+            int byteIdx = i / 8;
+            int bit = i % 8;
+            if ((data[byteIdx] & (1 << bit)) != 0) {
                 return i;
             }
         }
@@ -262,11 +285,13 @@ public class MyBitSetImpl implements MyBitSet, Cloneable {
 
     @Override
     public String toString() {
-        String bits = readBits();
+        byte[] data = readBytes();
         StringBuilder sb = new StringBuilder("{");
         boolean first = true;
-        for (int i = 0; i < bits.length(); i++) {
-            if (bits.charAt(i) == '1') {
+        for (int i = 0; i < size; i++) {
+            int byteIdx = i / 8;
+            int bit = i % 8;
+            if ((data[byteIdx] & (1 << bit)) != 0) {
                 if (!first) {
                     sb.append(',');
                 }
